@@ -221,18 +221,15 @@ class ConcurrentMultiSpanProcessor(SpanProcessor):
     def __init__(self, num_threads: int = 2):
         # use a tuple to avoid race conditions when adding a new span and
         # iterating through it on "on_start" and "on_end".
-        self._span_processors: tuple[SpanProcessor] = ()
+        self._span_processors = ()  # type: Tuple[SpanProcessor, ...]
         self._lock = threading.Lock()
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=num_threads
         )
-        self._is_shutdown: bool = False
 
     def add_span_processor(self, span_processor: SpanProcessor) -> None:
         """Adds a SpanProcessor to the list handled by this instance."""
         with self._lock:
-            if self._is_shutdown:
-                return
             self._span_processors += (span_processor,)
 
     def _submit_and_await(
@@ -242,13 +239,9 @@ class ConcurrentMultiSpanProcessor(SpanProcessor):
         **kwargs: Any,
     ):
         futures = []
-        with self._lock:
-            if self._is_shutdown:
-                return
-            for sp in self._span_processors:
-                future = self._executor.submit(func(sp), *args, **kwargs)
-                futures.append(future)
-
+        for sp in self._span_processors:
+            future = self._executor.submit(func(sp), *args, **kwargs)
+            futures.append(future)
         for future in futures:
             future.result()
 
@@ -265,16 +258,8 @@ class ConcurrentMultiSpanProcessor(SpanProcessor):
         self._submit_and_await(lambda sp: sp.on_end, span)
 
     def shutdown(self) -> None:
-        """Shuts down all underlying span processors and the executor."""
-        with self._lock:
-            if self._is_shutdown:
-                return
-            self._is_shutdown = True
-
-            for sp in self._span_processors:
-                sp.shutdown()
-
-            self._executor.shutdown(wait=True)
+        """Shuts down all underlying span processors in parallel."""
+        self._submit_and_await(lambda sp: sp.shutdown)
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         """Calls force_flush on all underlying span processors in parallel.
@@ -287,14 +272,10 @@ class ConcurrentMultiSpanProcessor(SpanProcessor):
             True if all span processors flushed their spans within the given
             timeout, False otherwise.
         """
-        with self._lock:
-            if self._is_shutdown:
-                return False
-
-            futures = []
-            for sp in self._span_processors:
-                future = self._executor.submit(sp.force_flush, timeout_millis)
-                futures.append(future)
+        futures = []
+        for sp in self._span_processors:  # type: SpanProcessor
+            future = self._executor.submit(sp.force_flush, timeout_millis)
+            futures.append(future)
 
         timeout_sec = timeout_millis / 1e3
         done_futures, not_done_futures = concurrent.futures.wait(
